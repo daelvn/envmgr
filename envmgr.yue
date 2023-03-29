@@ -1,0 +1,281 @@
+import "lyaml" as yaml
+import "argparse" as ArgParse
+import "serpent" as serpent
+import "inspect" as inspect
+
+unpack ??= table.unpack
+
+parser = ArgParse "envmgr", "Environment variable manager"
+with parser
+  \command_target "command"
+  -- envmgr list
+  with \command "list l", "List all known environments"
+    \flag "--include-default", "Include the default environment"
+  -- envmgr env <env> [cmd]
+  with \command "environment env e", "Manage the current environment"
+    \command_target "env_subcommand"
+    -- envmgr env <env> dump
+    with \command "dump", "Dump the current environment"
+      \flag "--shell", "Dump as a list of exports for a shell"
+      \flag "--lua", "Dump as Lua"
+    -- envmgr env <env> load <input>
+    -- with \command "load", "Load an environment dump into an environment name"
+    --   \argument "input", "Environment dump to load"
+    -- envmgr env <env> show
+    with \command "show", "Lists the current environment variables"
+      \option "--merge", "Merge names into single words"
+    -- envmgr env <env> eval
+    \command "eval", "Set environment for your current shell"
+    -- <env>
+    with \argument "env", "Environment to use"
+      \default "default"
+  -- envmgr config
+  with \command "configure config c", "Configure envmgr"
+    \option "--output-upper", "Transform all variable names to uppercase on dump/output"
+    \option "--output-flatten", "Flatten nested variable names on dump/output"
+    \option "--input-nest", "Transform flat variable names into a nested representation"
+    \option "--input-lower", "Transform all variable names to lowercase on set"
+  -- envmgr add
+  with \command "set s", "Set an environment variable in the current environment."
+    \option "-e --env", "Set in a different environment"
+    \option "-k --key", "Name of the environment variable"
+    \option "-v --value", "Value of the environment variable"
+  -- envmgr delete
+  with \command "delete del d", "Delete an environment variable"
+    \argument "variable", "Name of the variable to delete"
+  -- envmgr --from
+  with \option "-f --from", "Path to envmgr manager file"
+    \default (os.getenv "HOME") and "#{os.getenv 'HOME'}/.envmgr.yml" or "./.envmgr.yml"
+    -- \default "./.envmgr.yml"
+  -- envmgr --debug
+  with \flag "--debug", "Activate debug mode"
+    \default false
+
+args = parser\parse!
+DEBUG = args.debug
+
+loadEnvfile = (file) ->
+  if DEBUG then print "loading #{file}"
+  local contents
+  with io.open file, "r"
+    try
+      raw = \read "*a"
+      try
+        contents = yaml.load raw
+        \close!
+      catch err
+        \close!
+        error "Could not load YAML in envmgr file #{file}: #{err}"
+    catch err
+      \close!
+      error "Could not read from envmgr file #{file}: #{err}"
+  return contents
+
+writeEnvfile = (file, contents) ->
+  if DEBUG
+    print "writing to #{file}"
+    print "inspect: #{inspect contents}"
+    print "contents: #{yaml.dump {contents}}"
+  with io.open file, "w"
+    try
+      \write yaml.dump {contents}
+      \close!
+    catch err
+      \close!
+      error "Could not write to envmgr file #{file}: #{err}"
+
+transformEnvToUpper = (env) ->
+  result = {}
+  for node, val in pairs env
+    if "table" == type val
+      result[node\upper!] = transformEnvToUpper val
+    else
+      result[node\upper!] = val
+  return result
+
+transformEnvFlatten = (env, base, result={}) ->
+  for node, val in pairs env
+    if "table" == type val
+      transformEnvFlatten val, base and base..'_'..node or node, result
+    else
+      result["#{base and (base..'_') or ''}#{node}"] = val
+  return result
+
+keysFor = (t) -> [k for k, v in pairs t]
+
+transformEnvFlattenSinglets = (env, parent, config) ->
+  config.inputNest = {enabled: true} if ("table" != type config.inputNest) or (config.inputNest == true)
+  if DEBUG
+    print "parent: #{parent}, children: #{#(keysFor env)}"
+  result = {}
+  for node, val in pairs env
+    if "table" == type val
+      if config.inputNest.minimumChildren and (#(keysFor val) < config.inputNest.minimumChildren)
+        merged = "#{parent and parent..'_' or ''}#{node}"
+        result[merged] = transformEnvFlattenSinglets val, merged, config
+      else
+        result[node] = transformEnvFlattenSinglets val, node, config
+    else
+      result[node] = val
+  return result
+
+transformEnvFlattenSinglets = (env, config) ->
+  config.inputNest = {enabled: true} if ("table" != type config.inputNest) or (config.inputNest == true)
+  result = {}
+  if "table" != type env
+    return env
+  for key, val in pairs env
+    if "table" == type val
+      canMerge = config.inputNest.minimumChildren and (#(keysFor val) < config.inputNest.minimumChildren)
+      if canMerge
+        merged = "#{key}_#{(keysFor val)[1]}"
+        result[merged] = transformEnvFlattenSinglets val[(keysFor val)[1]], config
+      else
+        result[key] = transformEnvFlattenSinglets val, config
+    else
+      result[key] = val
+
+  return result
+
+
+dumpAsShell = (env, base, config) ->
+  if DEBUG
+    print "dumping as shell"
+    print inspect env
+  final = ""
+  env = transformEnvFlatten env if config.outputFlatten
+  for node, val in pairs env
+    node = node\upper! if config.outputUpper
+    print "#{base}/#{node}=#{val}" if DEBUG
+    if "table" == type val
+      final ..= dumpAsShell val, node, config
+    else
+      final ..= "export #{node}=#{val}\r\n"
+  return final
+
+
+printColumns = (env, indent=0, padding=3, config) ->
+  -- calculate longest key
+  flattened = transformEnvFlatten env
+  flattenedKeys = [key for key, value in pairs flattened]
+  table.sort(flattenedKeys, (a, b) -> (string.len a) > (string.len b))
+  flattenedLongestKey = flattenedKeys[1]
+  -- calculate paddings
+  indentStr = string.rep " ", indent
+  innerPaddingStr = (key) -> string.rep " ", (string.len flattenedLongestKey) - (string.len key)
+  paddingStr = string.rep " ", padding
+  -- print header
+  if indent == 0
+    print "Name#{innerPaddingStr 'Name'}#{paddingStr}Value"
+    print "====#{innerPaddingStr '===='}#{paddingStr}====="
+  -- print columns
+  for key, value in pairs env
+    key = key\upper! if config.outputUpper
+    if "table" == type value
+      print "#{indentStr}#{key}#{innerPaddingStr key}#{paddingStr}"
+      printColumns value, indent+2, padding, config
+    else
+      print "#{indentStr}#{key}#{innerPaddingStr key}#{paddingStr}#{value}"
+
+dispatchEnvCommand = (args, envfile, envName) ->
+  env = envfile.environments[envName]
+  env ??= {}
+  env = transformEnvFlatten env if envfile.configuration.outputFlatten
+  switch args.env_subcommand
+    when "show"
+      printColumns env, 0, 3, envfile.configuration
+      -- print inspect env 
+    when "dump"
+      if args.shell
+        print dumpAsShell env, nil, envfile.configuration
+      elseif args.lua
+        if envfile.configuration.outputUpper
+          print serpent.dump transformEnvToUpper env
+        else
+          print serpent.dump env
+      else
+        if envfile.configuration.outputUpper
+          print yaml.dump {transformEnvToUpper env}
+        else
+          print yaml.dump {env}
+
+dispatchConfigureCommand = (args, envfile) ->
+  envfile.configuration ??= {}
+  envfile.configuration.outputUpper = args.output_upper
+  envfile.configuration.outputFlatten = args.output_flatten
+  envfile.configuration.inputNest = args.input_nest
+  envfile.configuration.inputLower = args.input_lower
+  writeEnvfile args.from, envfile
+
+parseSetActions = (all) ->
+  vars = {}
+  for line in all\gmatch "[^\r\n]+"
+    continue if line\match "^#"
+    line = line\gsub "^export ", ""
+    key, value = line\match "([a-zA-Z0-9_]+)=(.+)"
+    vars[key] = value
+  return vars
+
+setComplexKey = (env={}, key, value, config={}) ->
+  key = key\lower! if config.inputLower
+  key = key\gsub "_", "." if config.inputNest
+  if key\match "%."
+    parent, children = key\match "^([^%.]+)%.(.+)"
+    env[parent] ??= {}
+    setComplexKey env[parent], children, value
+  else
+    env[key] = value
+
+dispatchSetCommand = (args, envfile) ->
+  selector = args.env or envfile.current or "default"
+  config = envfile.configuration
+  envfile.environments[selector] ??= {}
+  env = envfile.environments[selector]
+  if args.key and args.value
+    setComplexKey env, args.key, args.value, config
+  elseif args.key
+    value = io.read "*a"
+    setComplexKey env, args.key, value, config
+  else
+    vars = parseSetActions io.read "*a"
+    if DEBUG
+      print inspect vars
+    for key, value in pairs vars
+      setComplexKey env, key, value, config
+  -- flatten singlets if config set
+  envfile.environments[selector] = transformEnvFlattenSinglets env, config if ("table" == type config.inputNest) and config.inputNest.enabled
+  -- write
+  writeEnvfile args.from, envfile
+
+dispatchDeleteCommand = (args, envfile) ->
+  envfile.environments[envfile.current or "default"][args.variable] = nil
+  writeEnvfile args.from, envfile
+
+dispatchListCommand = (args, envfile) ->
+  final = "Environment\r\n==========="
+  for key, value in pairs envfile.environments
+    continue if (key == "default") and not args.include_default
+    final ..= "\r\n#{key}"
+  os.execute "echo '#{final}' | column -t -s '***'"
+
+main = (args) ->
+  envfile = loadEnvfile args.from
+  switch args.command
+    -- TODO: add command to init config file
+    when "configure"
+      dispatchConfigureCommand args, envfile
+    when "set"
+      dispatchSetCommand args, envfile
+    when "delete"
+      dispatchDeleteCommand args, envfile
+    when "list"
+      dispatchListCommand args, envfile
+    when "environment"
+      envName = args.env
+      if envfile.current != envName
+        envfile.current = envName
+        writeEnvfile args.from, envfile
+      dispatchEnvCommand args, envfile, envName
+
+-- print inspect args
+main args

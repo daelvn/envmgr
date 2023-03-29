@@ -1,0 +1,14 @@
+package: envmgr
+
+description:
+  summary: Program for managing environment variables
+  license: Unlicense
+  homepage: https://github.com/daelvn/envmgr
+
+dependencies:
+  - lyaml
+  - argparse
+  - serpent
+
+source:
+  url: git://github.com/daelvn/envmgr.git

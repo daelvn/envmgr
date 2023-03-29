@@ -1,0 +1,13 @@
+---
+configuration:
+  outputUpper: true
+  inputLower: true
+  outputFlatten: true
+  inputNest:
+    enabled: true
+    minimumChildren: 2
+current: default
+environments:
+  default:
+    editor: nvim
+...
